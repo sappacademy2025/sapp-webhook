@@ -6,19 +6,21 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ✅ Initialize Firebase Admin SDK using environment variable
-const firebaseConfig = process.env.FIREBASE_CONFIG;
-
-if (!firebaseConfig) {
-  console.error("❌ Missing FIREBASE_CONFIG environment variable");
+// --- Load Firebase service account from env var ------------------------------------------------
+const saRaw =
+  process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG;
+if (!saRaw) {
+  console.error(
+    "❌ Missing FIREBASE_SERVICE_ACCOUNT (or FIREBASE_CONFIG) environment variable"
+  );
   process.exit(1);
 }
 
 let serviceAccount;
 try {
-  serviceAccount = JSON.parse(firebaseConfig);
+  serviceAccount = JSON.parse(saRaw);
 } catch (err) {
-  console.error("❌ Invalid FIREBASE_CONFIG JSON:", err);
+  console.error("❌ Invalid JSON in FIREBASE_SERVICE_ACCOUNT:", err);
   process.exit(1);
 }
 
@@ -29,34 +31,41 @@ console.log("✅ Firebase connected successfully!");
 
 const db = admin.firestore();
 
-// ✅ Your NOWPayments secret (set this also in Render)
+// --- NowPayments secret ------------------------------------------------
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
+if (!NOWPAYMENTS_SECRET) {
+  console.warn(
+    "⚠️ NOWPAYMENTS_SECRET not set — signature verification will fail"
+  );
+}
 
+// --- Webhook endpoint ------------------------------------------------
 app.post("/webhook", async (req, res) => {
   try {
     const signature = req.headers["x-nowpayments-sig"];
-    if (signature !== NOWPAYMENTS_SECRET) {
-      console.log("❌ Invalid signature");
+    if (!signature || signature !== NOWPAYMENTS_SECRET) {
+      console.log("❌ Invalid signature:", signature);
       return res.status(401).send("Unauthorized");
     }
 
     const data = req.body;
-    console.log("💰 Payment received:", data);
+    console.log("💰 Payment received:", JSON.stringify(data));
 
     if (data.payment_status !== "finished") {
-      console.log("Payment not completed yet, ignoring...");
-      return res.status(200).send("Pending ignored");
+      console.log("Payment not finished, ignoring.");
+      return res.status(200).send("ignored");
     }
 
-    // Extract course + userId from your order_id (like sapp_beginner_uid_timestamp)
-    const [prefix, course, userId] = data.order_id.split("_");
-
-    if (!userId || !course) {
-      console.log("❌ Invalid order_id format:", data.order_id);
-      return res.status(400).send("Invalid order_id format");
+    // Expect order_id format: sapp_<course>_<userId>_<timestamp>
+    const parts = (data.order_id || "").split("_");
+    if (parts.length < 3 || parts[0] !== "sapp") {
+      console.log("❌ Invalid order_id:", data.order_id);
+      return res.status(400).send("Invalid order_id");
     }
+    const course = parts[1];
+    const userId = parts[2];
 
-    // ✅ Unlock course for that user
+    // Write to Firestore
     await db
       .collection("payments")
       .doc(userId)
@@ -64,8 +73,8 @@ app.post("/webhook", async (req, res) => {
         {
           [course]: {
             status: "paid",
-            currency: data.pay_currency,
-            amount: data.price_amount,
+            amount: data.price_amount || null,
+            currency: data.pay_currency || null,
             timestamp: new Date().toISOString(),
           },
         },
@@ -76,10 +85,10 @@ app.post("/webhook", async (req, res) => {
     return res.status(200).send("ok");
   } catch (err) {
     console.error("🔥 Webhook error:", err);
-    res.status(500).send("Server error");
+    return res.status(500).send("server error");
   }
 });
 
-// ✅ Start server
+// --- Start server ------------------------------------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Webhook running on port ${PORT}`));
