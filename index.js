@@ -39,6 +39,38 @@ if (!NOWPAYMENTS_SECRET) {
   );
 }
 
+// --- TEMP TEST ROUTE ------------------------------------------------
+// Unlocks a course without paying (for testing)
+app.get("/test-unlock", async (req, res) => {
+  try {
+    const userId = req.query.uid || "TEST_USER";
+    const course = req.query.course || "beginner";
+
+    await db
+      .collection("payments")
+      .doc(userId)
+      .set(
+        {
+          [course]: {
+            status: "paid",
+            amount: "TEST",
+            currency: "TEST",
+            timestamp: new Date().toISOString(),
+          },
+        },
+        { merge: true }
+      );
+
+    console.log(
+      `🎉 TEST UNLOCK: Course '${course}' unlocked for user '${userId}'`
+    );
+    res.send(`TEST UNLOCK SUCCESS → User: ${userId}, Course: ${course}`);
+  } catch (err) {
+    console.error("🔥 TEST UNLOCK ERROR:", err);
+    res.status(500).send("error");
+  }
+});
+
 // --- Webhook endpoint ------------------------------------------------
 app.post("/webhook", async (req, res) => {
   try {
