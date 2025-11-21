@@ -6,14 +6,16 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ---------------------------------------------------------------------------
-// Load Firebase Admin Credentials
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Load Firebase service account from environment (Render)
+// ------------------------------------------------------------------
 const saRaw =
   process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG;
 
 if (!saRaw) {
-  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT environment variable");
+  console.error(
+    "❌ Missing FIREBASE_SERVICE_ACCOUNT (or FIREBASE_CONFIG) environment variable"
+  );
   process.exit(1);
 }
 
@@ -21,7 +23,7 @@ let serviceAccount;
 try {
   serviceAccount = JSON.parse(saRaw);
 } catch (err) {
-  console.error("❌ Invalid FIREBASE_SERVICE_ACCOUNT JSON:", err);
+  console.error("❌ Invalid JSON in FIREBASE_SERVICE_ACCOUNT:", err);
   process.exit(1);
 }
 
@@ -29,110 +31,151 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-console.log("✅ Firebase Admin initialized");
+console.log("✅ Firebase connected successfully!");
+
 const db = admin.firestore();
 
-// ---------------------------------------------------------------------------
-// Load NOWPayments Secret
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// NOWPayments secret for simple signature check
+// ------------------------------------------------------------------
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
-
 if (!NOWPAYMENTS_SECRET) {
-  console.warn("⚠️ NOWPAYMENTS_SECRET missing — signatures cannot be validated.");
+  console.warn(
+    "⚠️ NOWPAYMENTS_SECRET not set — signature verification will fail"
+  );
 }
 
-// ---------------------------------------------------------------------------
-// Webhook
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Helper: safely read numeric value
+// ------------------------------------------------------------------
+function toNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+// ------------------------------------------------------------------
+// Webhook endpoint
+// ------------------------------------------------------------------
 app.post("/webhook", async (req, res) => {
   try {
+    // 1) Basic signature check (simple equality – good enough for now)
     const signature = req.headers["x-nowpayments-sig"];
-
-    // Verify signature
     if (!signature || signature !== NOWPAYMENTS_SECRET) {
-      console.log("❌ Invalid signature");
+      console.log("❌ Invalid signature:", signature);
       return res.status(401).send("Unauthorized");
     }
 
     const data = req.body;
-    console.log("💰 Received Payment:", JSON.stringify(data));
+    console.log("💰 Payment received:", JSON.stringify(data));
 
+    // 2) Only handle finished payments
     if (data.payment_status !== "finished") {
-      console.log("⌛ Payment not finished, ignoring.");
+      console.log("ℹ️ Payment not finished, ignoring. Status:", data.payment_status);
       return res.status(200).send("ignored");
     }
 
-    // Expect: sapp_<course>_<userId>_<timestamp>
-    const parts = (data.order_id || "").split("_");
+    // ----------------------------------------------------------------
+    // 3) Parse order_id
+    //    We support both:
+    //      - sapp_<productKey>_<userId>_<timestamp>
+    //      - sapp_<course>_<userId>_<timestamp>
+    //    productKey or course will be used as our "plan" / slug.
+    // ----------------------------------------------------------------
+    const orderId = data.order_id || "";
+    const parts = orderId.split("_");
 
     if (parts.length < 3 || parts[0] !== "sapp") {
-      console.log("❌ Invalid order_id:", data.order_id);
+      console.log("❌ Invalid order_id format:", orderId);
       return res.status(400).send("Invalid order_id");
     }
 
-    const course = parts[1];
+    const productOrCourse = parts[1]; // e.g. beginner_free, advanced, etc.
     const userId = parts[2];
 
-    // -----------------------------------------------------------------------
-    // Fetch user's email from Firestore (if exists)
-    // -----------------------------------------------------------------------
-    let email = "unknown";
-
-    try {
-      const userDoc = await db.collection("users").doc(userId).get();
-      if (userDoc.exists) {
-        email = userDoc.data().email || "unknown";
-      }
-    } catch (err) {
-      console.log("⚠️ Failed to fetch user email");
+    if (!userId) {
+      console.log("❌ Missing userId in order_id:", orderId);
+      return res.status(400).send("Missing userId");
     }
 
-    // -----------------------------------------------------------------------
-    // Save payment unlock
-    // -----------------------------------------------------------------------
-    await db
-      .collection("payments")
-      .doc(userId)
-      .set(
-        {
-          [course]: {
-            status: "paid",
-            amount: data.price_amount || null,
-            currency: data.pay_currency || null,
-            timestamp: new Date().toISOString(),
-          },
-        },
-        { merge: true }
-      );
+    const planSlug = productOrCourse; // we’ll store under this key in payments
 
-    // -----------------------------------------------------------------------
-    // Save full transaction record
-    // -----------------------------------------------------------------------
-    const txnId = `txn_${Date.now()}_${Math.floor(Math.random() * 999999)}`;
+    // ----------------------------------------------------------------
+    // 4) Extract payment info
+    // ----------------------------------------------------------------
+    const amount = toNumber(data.price_amount);
+    const currency = data.pay_currency || data.price_currency || null;
+    const customerEmail = data.customer_email || data.order_description || null;
 
-    await db.collection("transactions").doc(txnId).set({
-      txnId,
-      userId,
-      email,
-      plan: course,
-      amount: data.price_amount || 0,
-      currency: data.pay_currency || "USD",
-      status: "paid",
-      gateway: "NOWPayments",
-      raw: data,
-      timestamp: new Date().toISOString(),
-    });
+    // Try to get a stable transaction id from NOWPayments
+    const rawPaymentId =
+      data.payment_id ||
+      data.invoice_id ||
+      data.order_id ||
+      `np_${Date.now()}`;
 
-    console.log(`✅ Saved transaction ${txnId} & unlocked course '${course}'`);
+    const txnId = String(rawPaymentId);
+
+    // ----------------------------------------------------------------
+    // 5) Write / merge into payments/{userId}
+    // ----------------------------------------------------------------
+    const paymentDocRef = db.collection("payments").doc(userId);
+
+    const paymentUpdate = {
+      [planSlug]: {
+        status: "paid",
+        amount: amount,
+        currency: currency,
+        gateway: "NOWPayments",
+        orderId: orderId || null,
+        txnId: txnId,
+        email: customerEmail || null,
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      },
+    };
+
+    await paymentDocRef.set(paymentUpdate, { merge: true });
+    console.log(`✅ Updated payments for user '${userId}' plan '${planSlug}'`);
+
+    // ----------------------------------------------------------------
+    // 6) Create / update transactions/{txnId}
+    // ----------------------------------------------------------------
+    const txnRef = db.collection("transactions").doc(txnId);
+
+    await txnRef.set(
+      {
+        userId,
+        email: customerEmail || null,
+        plan: planSlug,
+        amount: amount,
+        currency: currency,
+        status: "paid",
+        gateway: "NOWPayments",
+        orderId,
+        nowpaymentsPaymentId: data.payment_id || null,
+        nowpaymentsInvoiceId: data.invoice_id || null,
+        // raw data is optional; comment out if you want to save space
+        raw: data,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log(`🧾 Transaction '${txnId}' written to 'transactions' collection`);
+
+    // ----------------------------------------------------------------
+    // 7) Done
+    // ----------------------------------------------------------------
     return res.status(200).send("ok");
   } catch (err) {
-    console.error("🔥 Webhook Error:", err);
+    console.error("🔥 Webhook error:", err);
     return res.status(500).send("server error");
   }
 });
 
-// ---------------------------------------------------------------------------
-// Start Web Server
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Start server
+// ------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Webhook server online on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`🚀 Webhook running on port ${PORT}`);
+});
