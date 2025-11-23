@@ -7,13 +7,13 @@ app.use(cors());
 app.use(express.json());
 
 // ========================================================
-//  FIREBASE INITIALIZATION
+// FIREBASE INITIALIZATION (Render environment)
 // ========================================================
 const saRaw =
   process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG;
 
 if (!saRaw) {
-  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT env variable");
+  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT environment variable");
   process.exit(1);
 }
 
@@ -28,17 +28,25 @@ try {
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-console.log("✅ Firebase connected!");
 
+console.log("✅ Firebase connected successfully!");
 const db = admin.firestore();
 
 // ========================================================
-//  NOWPAYMENTS WEBHOOK
+// NOWPAYMENTS WEBHOOK — with full transaction logging
 // ========================================================
+
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
+
+// Safely convert to number
+function toNumber(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
 
 app.post("/webhook", async (req, res) => {
   try {
+    // Signature check
     const signature = req.headers["x-nowpayments-sig"];
     if (!signature || signature !== NOWPAYMENTS_SECRET) {
       console.log("❌ Invalid signature:", signature);
@@ -49,35 +57,85 @@ app.post("/webhook", async (req, res) => {
     console.log("💰 Payment received:", data);
 
     if (data.payment_status !== "finished") {
-      console.log("⏳ Payment not finished yet");
+      console.log("ℹ️ Payment not finished, ignoring.");
       return res.status(200).send("ignored");
     }
 
-    const parts = (data.order_id || "").split("_");
+    // Parse order ID: sapp_<planSlug>_<userId>_<timestamp>
+    const orderId = data.order_id || "";
+    const parts = orderId.split("_");
+
     if (parts.length < 3 || parts[0] !== "sapp") {
-      console.log("❌ Invalid order_id:", data.order_id);
+      console.log("❌ Invalid order_id format:", orderId);
       return res.status(400).send("Invalid order_id");
     }
 
-    const course = parts[1];
+    const planSlug = parts[1];
     const userId = parts[2];
 
+    if (!userId) {
+      console.log("❌ userId missing in order ID");
+      return res.status(400).send("Missing userId");
+    }
+
+    // Extract values
+    const amount = toNumber(data.price_amount);
+    const currency = data.pay_currency || data.price_currency || null;
+    const customerEmail = data.customer_email || null;
+
+    const txnId =
+      data.payment_id || data.invoice_id || orderId || `np_${Date.now()}`;
+
+    // ------------------------------------------
+    // Write merged payment info
+    // ------------------------------------------
     await db
       .collection("payments")
       .doc(userId)
       .set(
         {
-          [course]: {
+          [planSlug]: {
             status: "paid",
-            amount: data.price_amount || null,
-            currency: data.pay_currency || null,
-            timestamp: Date.now(),
+            amount,
+            currency,
+            gateway: "NOWPayments",
+            email: customerEmail,
+            orderId,
+            txnId,
+            timestamp: admin.firestore.FieldValue.serverTimestamp(),
           },
         },
         { merge: true }
       );
 
-    console.log(`✅ Course '${course}' unlocked for user '${userId}'`);
+    console.log(`✅ Updated payments for user '${userId}' plan '${planSlug}'`);
+
+    // ------------------------------------------
+    // Save into transactions collection
+    // ------------------------------------------
+    await db
+      .collection("transactions")
+      .doc(String(txnId))
+      .set(
+        {
+          userId,
+          email: customerEmail,
+          plan: planSlug,
+          amount,
+          currency,
+          status: "paid",
+          gateway: "NOWPayments",
+          orderId,
+          nowpaymentsPaymentId: data.payment_id || null,
+          nowpaymentsInvoiceId: data.invoice_id || null,
+          raw: data,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+        { merge: true }
+      );
+
+    console.log(`🧾 Transaction '${txnId}' saved.`);
+
     return res.status(200).send("ok");
   } catch (err) {
     console.error("🔥 Webhook error:", err);
@@ -86,7 +144,7 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ========================================================
-//  BREVO WEBHOOK — store email events (open, click, bounce...)
+// BREVO EMAIL EVENT WEBHOOK
 // ========================================================
 
 app.post("/brevo/webhook", async (req, res) => {
@@ -100,7 +158,7 @@ app.post("/brevo/webhook", async (req, res) => {
     await db.collection("emailEvents").add({
       email: event.email.toLowerCase(),
       event: event.event || "unknown",
-      timestamp: Date.now(),
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
       raw: event,
     });
 
@@ -112,8 +170,9 @@ app.post("/brevo/webhook", async (req, res) => {
 });
 
 // ========================================================
-// OPTIONAL: Add subscriber from website
+// /subscribe — Save subscriber from front-end
 // ========================================================
+
 app.post("/subscribe", async (req, res) => {
   try {
     const { email, uid = null, source = "manual" } = req.body;
@@ -130,17 +189,17 @@ app.post("/subscribe", async (req, res) => {
     if (q.empty) {
       await db.collection("subscribers").add({
         email: lower,
-        uid: uid,
+        uid,
         status: "active",
         source,
-        createdAt: Date.now(),
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     } else {
       const id = q.docs[0].id;
       await db.collection("subscribers").doc(id).update({
         uid,
         source,
-        updatedAt: Date.now(),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     }
 
@@ -152,7 +211,8 @@ app.post("/subscribe", async (req, res) => {
 });
 
 // ========================================================
-//  START SERVER
+// START SERVER
 // ========================================================
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
