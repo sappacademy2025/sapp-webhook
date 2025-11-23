@@ -1,7 +1,6 @@
 import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
-import Brevo from "@getbrevo/brevo"; // <-- NEW: Brevo SDK
 
 const app = express();
 app.use(cors());
