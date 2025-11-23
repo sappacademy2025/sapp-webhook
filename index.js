@@ -33,43 +33,11 @@ console.log("✅ Firebase connected successfully!");
 const db = admin.firestore();
 
 // ========================================================
-// BREVO INITIALIZATION
-// ========================================================
-const brevoEmailApi = new Brevo.TransactionalEmailsApi();
-brevoEmailApi.setApiKey(
-  Brevo.TransactionalEmailsApiApiKeys.apiKey,
-  process.env.BREVO_API_KEY // <-- Put this in Render
-);
-
-// Helper function to send email
-async function sendCourseUnlockedEmail(to, courseName) {
-  try {
-    const emailData = {
-      sender: { name: "SAPP Academy", email: "sapp.academy2025@gmail.com" },
-      to: [{ email: to }],
-      subject: `🎉 Your ${courseName} Course is Now Unlocked!`,
-      htmlContent: `
-        <h2>Congratulations!</h2>
-        <p>Your course <b>${courseName}</b> is now unlocked.</p>
-        <p>You can now login anytime:</p>
-        <a href="https://sapp-academy.web.app" target="_blank">
-          Go to Dashboard
-        </a>
-      `,
-    };
-
-    await brevoEmailApi.sendTransacEmail(emailData);
-    console.log("📧 Brevo email sent to", to);
-  } catch (err) {
-    console.error("🔥 Error sending Brevo email:", err);
-  }
-}
-
-// ========================================================
 // NOWPAYMENTS WEBHOOK — with full transaction logging
 // ========================================================
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
 
+// Convert to number safely
 function toNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
@@ -114,6 +82,7 @@ app.post("/webhook", async (req, res) => {
     const txnId =
       data.payment_id || data.invoice_id || orderId || `np_${Date.now()}`;
 
+    // Update payments/{userId}
     await db
       .collection("payments")
       .doc(userId)
@@ -135,6 +104,7 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`✅ Updated payments for user '${userId}' plan '${planSlug}'`);
 
+    // Write transaction record
     await db
       .collection("transactions")
       .doc(String(txnId))
@@ -157,13 +127,6 @@ app.post("/webhook", async (req, res) => {
       );
 
     console.log(`🧾 Transaction '${txnId}' saved.`);
-
-    // -----------------------------------------------------------
-    // NEW: Send Course Unlocked Email Automatically
-    // -----------------------------------------------------------
-    if (customerEmail) {
-      await sendCourseUnlockedEmail(customerEmail, planSlug);
-    }
 
     return res.status(200).send("ok");
   } catch (err) {
