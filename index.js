@@ -1,13 +1,14 @@
 import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
+import fetch from "node-fetch"; // Required for SMTP API call
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 // ========================================================
-// FIREBASE INITIALIZATION (Render environment)
+// FIREBASE INITIALIZATION
 // ========================================================
 const saRaw =
   process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG;
@@ -29,60 +30,93 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-console.log("✅ Firebase connected successfully!");
+console.log("✅ Firebase connected!");
 const db = admin.firestore();
 
 // ========================================================
-// NOWPAYMENTS WEBHOOK — with full transaction logging
+// SEND EMAIL (Brevo SMTP API)
+// ========================================================
+app.post("/send-email", async (req, res) => {
+  try {
+    const { to, subject, html } = req.body;
+
+    if (!to || !subject || !html) {
+      return res.status(400).send("Missing email fields");
+    }
+
+    const payload = {
+      sender: {
+        name: "SAPP Academy",
+        email: "sapp.academy2025@gmail.com",
+      },
+      to: [{ email: to }],
+      subject,
+      htmlContent: html,
+    };
+
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "api-key": process.env.BREVO_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+    console.log("📧 Brevo Email Sent:", data);
+
+    return res.status(200).json({ ok: true, brevo: data });
+  } catch (error) {
+    console.error("🔥 Email send error:", error);
+    return res.status(500).send("Email error");
+  }
+});
+
+// ========================================================
+// NOWPAYMENTS WEBHOOK (Upgraded + Auto Email)
 // ========================================================
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
 
-// Convert to number safely
-function toNumber(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : null;
+function toNumber(x) {
+  const v = Number(x);
+  return Number.isFinite(v) ? v : null;
 }
 
 app.post("/webhook", async (req, res) => {
   try {
+    // Validate signature
     const signature = req.headers["x-nowpayments-sig"];
     if (!signature || signature !== NOWPAYMENTS_SECRET) {
-      console.log("❌ Invalid signature:", signature);
+      console.log("❌ Unauthorized webhook request");
       return res.status(401).send("Unauthorized");
     }
 
     const data = req.body;
-    console.log("💰 Payment received:", data);
+    console.log("💰 Webhook Received:", data);
 
+    // Ignore if not finished
     if (data.payment_status !== "finished") {
-      console.log("ℹ️ Payment not finished, ignoring.");
       return res.status(200).send("ignored");
     }
 
-    const orderId = data.order_id || "";
-    const parts = orderId.split("_");
-
-    if (parts.length < 3 || parts[0] !== "sapp") {
-      console.log("❌ Invalid order_id format:", orderId);
+    // Parse order_id: sapp_<plan>_<user>
+    const orderParts = (data.order_id || "").split("_");
+    if (orderParts.length < 3 || orderParts[0] !== "sapp") {
       return res.status(400).send("Invalid order_id");
     }
 
-    const planSlug = parts[1];
-    const userId = parts[2];
-
-    if (!userId) {
-      console.log("❌ userId missing in order ID");
-      return res.status(400).send("Missing userId");
-    }
+    const planSlug = orderParts[1];
+    const userId = orderParts[2];
+    const email = data.customer_email || null;
 
     const amount = toNumber(data.price_amount);
-    const currency = data.pay_currency || data.price_currency || null;
-    const customerEmail = data.customer_email || null;
+    const currency = data.pay_currency || data.price_currency;
 
     const txnId =
-      data.payment_id || data.invoice_id || orderId || `np_${Date.now()}`;
+      data.payment_id || data.invoice_id || data.order_id || `np_${Date.now()}`;
 
-    // Update payments/{userId}
+    // Save payment status
     await db
       .collection("payments")
       .doc(userId)
@@ -92,9 +126,9 @@ app.post("/webhook", async (req, res) => {
             status: "paid",
             amount,
             currency,
+            email,
             gateway: "NOWPayments",
-            email: customerEmail,
-            orderId,
+            orderId: data.order_id,
             txnId,
             timestamp: admin.firestore.FieldValue.serverTimestamp(),
           },
@@ -102,31 +136,46 @@ app.post("/webhook", async (req, res) => {
         { merge: true }
       );
 
-    console.log(`✅ Updated payments for user '${userId}' plan '${planSlug}'`);
+    console.log("💾 Payment updated in Firestore");
 
-    // Write transaction record
-    await db
-      .collection("transactions")
-      .doc(String(txnId))
-      .set(
-        {
-          userId,
-          email: customerEmail,
-          plan: planSlug,
-          amount,
-          currency,
-          status: "paid",
-          gateway: "NOWPayments",
-          orderId,
-          nowpaymentsPaymentId: data.payment_id || null,
-          nowpaymentsInvoiceId: data.invoice_id || null,
-          raw: data,
-          createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
+    // Save transaction
+    await db.collection("transactions").doc(String(txnId)).set(
+      {
+        userId,
+        email,
+        plan: planSlug,
+        amount,
+        currency,
+        status: "paid",
+        gateway: "NOWPayments",
+        orderId: data.order_id,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        raw: data,
+      },
+      { merge: true }
+    );
 
-    console.log(`🧾 Transaction '${txnId}' saved.`);
+    console.log("🧾 Transaction logged");
+
+    // AUTO EMAIL: send unlock email
+    if (email) {
+      console.log("📨 Sending unlock email to:", email);
+
+      await fetch("https://sapp-webhook-1.onrender.com/send-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          to: email,
+          subject: `🎉 Your ${planSlug} course is now unlocked!`,
+          html: `
+            <h2>🎉 Congratulations!</h2>
+            <p>Your course <b>${planSlug}</b> has been successfully unlocked.</p>
+            <p>You can now log in anytime:</p>
+            <a href="https://sapp-academy.web.app">➡ Go to Dashboard</a>
+          `,
+        }),
+      });
+    }
 
     return res.status(200).send("ok");
   } catch (err) {
@@ -136,15 +185,13 @@ app.post("/webhook", async (req, res) => {
 });
 
 // ========================================================
-// BREVO EMAIL EVENT WEBHOOK
+// BREVO EVENT WEBHOOK
 // ========================================================
 app.post("/brevo/webhook", async (req, res) => {
   try {
     const event = req.body;
 
-    console.log("📩 Brevo event received:", event);
-
-    if (!event.email) return res.status(200).send("no email");
+    if (!event.email) return res.status(200).send("ignored");
 
     await db.collection("emailEvents").add({
       email: event.email.toLowerCase(),
@@ -161,12 +208,11 @@ app.post("/brevo/webhook", async (req, res) => {
 });
 
 // ========================================================
-// /subscribe — Save subscriber from front-end
+// SUBSCRIBE ROUTE
 // ========================================================
 app.post("/subscribe", async (req, res) => {
   try {
     const { email, uid = null, source = "manual" } = req.body;
-
     if (!email) return res.status(400).send("Missing email");
 
     const lower = email.toLowerCase();
@@ -201,7 +247,7 @@ app.post("/subscribe", async (req, res) => {
 });
 
 // ========================================================
-// START SERVER
+// SERVER START
 // ========================================================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
