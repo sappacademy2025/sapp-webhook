@@ -6,13 +6,14 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// --- Load Firebase service account from env var ------------------------------------------------
+// ========================================================
+//  FIREBASE INITIALIZATION
+// ========================================================
 const saRaw =
   process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG;
+
 if (!saRaw) {
-  console.error(
-    "❌ Missing FIREBASE_SERVICE_ACCOUNT (or FIREBASE_CONFIG) environment variable"
-  );
+  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT env variable");
   process.exit(1);
 }
 
@@ -27,19 +28,15 @@ try {
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-console.log("✅ Firebase connected successfully!");
+console.log("✅ Firebase connected!");
 
 const db = admin.firestore();
 
-// --- NowPayments secret ------------------------------------------------
+// ========================================================
+//  NOWPAYMENTS WEBHOOK
+// ========================================================
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
-if (!NOWPAYMENTS_SECRET) {
-  console.warn(
-    "⚠️ NOWPAYMENTS_SECRET not set — signature verification will fail"
-  );
-}
 
-// --- Webhook endpoint ------------------------------------------------
 app.post("/webhook", async (req, res) => {
   try {
     const signature = req.headers["x-nowpayments-sig"];
@@ -49,23 +46,22 @@ app.post("/webhook", async (req, res) => {
     }
 
     const data = req.body;
-    console.log("💰 Payment received:", JSON.stringify(data));
+    console.log("💰 Payment received:", data);
 
     if (data.payment_status !== "finished") {
-      console.log("Payment not finished, ignoring.");
+      console.log("⏳ Payment not finished yet");
       return res.status(200).send("ignored");
     }
 
-    // Expect order_id format: sapp_<course>_<userId>_<timestamp>
     const parts = (data.order_id || "").split("_");
     if (parts.length < 3 || parts[0] !== "sapp") {
       console.log("❌ Invalid order_id:", data.order_id);
       return res.status(400).send("Invalid order_id");
     }
+
     const course = parts[1];
     const userId = parts[2];
 
-    // Write to Firestore
     await db
       .collection("payments")
       .doc(userId)
@@ -75,7 +71,7 @@ app.post("/webhook", async (req, res) => {
             status: "paid",
             amount: data.price_amount || null,
             currency: data.pay_currency || null,
-            timestamp: new Date().toISOString(),
+            timestamp: Date.now(),
           },
         },
         { merge: true }
@@ -89,6 +85,74 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// --- Start server ------------------------------------------------
+// ========================================================
+//  BREVO WEBHOOK — store email events (open, click, bounce...)
+// ========================================================
+
+app.post("/brevo/webhook", async (req, res) => {
+  try {
+    const event = req.body;
+
+    console.log("📩 Brevo event received:", event);
+
+    if (!event.email) return res.status(200).send("no email");
+
+    await db.collection("emailEvents").add({
+      email: event.email.toLowerCase(),
+      event: event.event || "unknown",
+      timestamp: Date.now(),
+      raw: event,
+    });
+
+    return res.status(200).send("stored");
+  } catch (err) {
+    console.error("🔥 Brevo webhook error:", err);
+    return res.status(500).send("error");
+  }
+});
+
+// ========================================================
+// OPTIONAL: Add subscriber from website
+// ========================================================
+app.post("/subscribe", async (req, res) => {
+  try {
+    const { email, uid = null, source = "manual" } = req.body;
+
+    if (!email) return res.status(400).send("Missing email");
+
+    const lower = email.toLowerCase();
+
+    const q = await db
+      .collection("subscribers")
+      .where("email", "==", lower)
+      .get();
+
+    if (q.empty) {
+      await db.collection("subscribers").add({
+        email: lower,
+        uid: uid,
+        status: "active",
+        source,
+        createdAt: Date.now(),
+      });
+    } else {
+      const id = q.docs[0].id;
+      await db.collection("subscribers").doc(id).update({
+        uid,
+        source,
+        updatedAt: Date.now(),
+      });
+    }
+
+    return res.status(200).send("saved");
+  } catch (err) {
+    console.error("🔥 Subscribe error:", err);
+    return res.status(500).send("error");
+  }
+});
+
+// ========================================================
+//  START SERVER
+// ========================================================
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Webhook running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
