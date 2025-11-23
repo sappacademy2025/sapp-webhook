@@ -1,6 +1,7 @@
 import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
+import Brevo from "@getbrevo/brevo"; // <-- NEW: Brevo SDK
 
 const app = express();
 app.use(cors());
@@ -33,12 +34,43 @@ console.log("✅ Firebase connected successfully!");
 const db = admin.firestore();
 
 // ========================================================
+// BREVO INITIALIZATION
+// ========================================================
+const brevoEmailApi = new Brevo.TransactionalEmailsApi();
+brevoEmailApi.setApiKey(
+  Brevo.TransactionalEmailsApiApiKeys.apiKey,
+  process.env.BREVO_API_KEY // <-- Put this in Render
+);
+
+// Helper function to send email
+async function sendCourseUnlockedEmail(to, courseName) {
+  try {
+    const emailData = {
+      sender: { name: "SAPP Academy", email: "sapp.academy2025@gmail.com" },
+      to: [{ email: to }],
+      subject: `🎉 Your ${courseName} Course is Now Unlocked!`,
+      htmlContent: `
+        <h2>Congratulations!</h2>
+        <p>Your course <b>${courseName}</b> is now unlocked.</p>
+        <p>You can now login anytime:</p>
+        <a href="https://sapp-academy.web.app" target="_blank">
+          Go to Dashboard
+        </a>
+      `,
+    };
+
+    await brevoEmailApi.sendTransacEmail(emailData);
+    console.log("📧 Brevo email sent to", to);
+  } catch (err) {
+    console.error("🔥 Error sending Brevo email:", err);
+  }
+}
+
+// ========================================================
 // NOWPAYMENTS WEBHOOK — with full transaction logging
 // ========================================================
-
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
 
-// Safely convert to number
 function toNumber(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
@@ -46,7 +78,6 @@ function toNumber(v) {
 
 app.post("/webhook", async (req, res) => {
   try {
-    // Signature check
     const signature = req.headers["x-nowpayments-sig"];
     if (!signature || signature !== NOWPAYMENTS_SECRET) {
       console.log("❌ Invalid signature:", signature);
@@ -61,7 +92,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("ignored");
     }
 
-    // Parse order ID: sapp_<planSlug>_<userId>_<timestamp>
     const orderId = data.order_id || "";
     const parts = orderId.split("_");
 
@@ -78,7 +108,6 @@ app.post("/webhook", async (req, res) => {
       return res.status(400).send("Missing userId");
     }
 
-    // Extract values
     const amount = toNumber(data.price_amount);
     const currency = data.pay_currency || data.price_currency || null;
     const customerEmail = data.customer_email || null;
@@ -86,9 +115,6 @@ app.post("/webhook", async (req, res) => {
     const txnId =
       data.payment_id || data.invoice_id || orderId || `np_${Date.now()}`;
 
-    // ------------------------------------------
-    // Write merged payment info
-    // ------------------------------------------
     await db
       .collection("payments")
       .doc(userId)
@@ -110,9 +136,6 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`✅ Updated payments for user '${userId}' plan '${planSlug}'`);
 
-    // ------------------------------------------
-    // Save into transactions collection
-    // ------------------------------------------
     await db
       .collection("transactions")
       .doc(String(txnId))
@@ -136,6 +159,13 @@ app.post("/webhook", async (req, res) => {
 
     console.log(`🧾 Transaction '${txnId}' saved.`);
 
+    // -----------------------------------------------------------
+    // NEW: Send Course Unlocked Email Automatically
+    // -----------------------------------------------------------
+    if (customerEmail) {
+      await sendCourseUnlockedEmail(customerEmail, planSlug);
+    }
+
     return res.status(200).send("ok");
   } catch (err) {
     console.error("🔥 Webhook error:", err);
@@ -146,7 +176,6 @@ app.post("/webhook", async (req, res) => {
 // ========================================================
 // BREVO EMAIL EVENT WEBHOOK
 // ========================================================
-
 app.post("/brevo/webhook", async (req, res) => {
   try {
     const event = req.body;
@@ -172,7 +201,6 @@ app.post("/brevo/webhook", async (req, res) => {
 // ========================================================
 // /subscribe — Save subscriber from front-end
 // ========================================================
-
 app.post("/subscribe", async (req, res) => {
   try {
     const { email, uid = null, source = "manual" } = req.body;
@@ -213,6 +241,5 @@ app.post("/subscribe", async (req, res) => {
 // ========================================================
 // START SERVER
 // ========================================================
-
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
