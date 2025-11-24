@@ -6,6 +6,8 @@ import fetch from "node-fetch"; // SMTP API calls
 const app = express();
 app.use(cors());
 app.use(express.json());
+// 🔥 Serve static files (logo, icons, etc.)
+app.use(express.static("public"));
 
 // ========================================================
 // FIREBASE INITIALIZATION
@@ -99,7 +101,7 @@ function SAPP_TEMPLATE({ title, messageHTML }) {
       <div style="text-align:center;color:#888;font-size:12px;">
         SAPP Academy • All Rights Reserved <br>
         <div style="margin-top:10px;">
-          <a href="https://wa.me/250788000000" style="color:#4ea1ff;text-decoration:none;margin-right:10px;">
+          <a href="https://wa.me/message/F6VR7MBP3TUCM1" style="color:#4ea1ff;text-decoration:none;margin-right:10px;">
             WhatsApp Support
           </a>
           |
