@@ -227,7 +227,7 @@ app.post("/subscribe", async (req, res) => {
 });
 
 // ========================================================
-// NOWPAYMENTS WEBHOOK LOGIC (Statuses + Auto Emails)
+// NOWPAYMENTS WEBHOOK LOGIC (Statuses + Auto Emails + Affiliate Commission)
 // ========================================================
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
 
@@ -255,9 +255,10 @@ app.post("/webhook", async (req, res) => {
 
     const planSlug = orderParts[1];
     const userId = orderParts[2];
+    const referrerId = orderParts[3] || null; // NEW
     const email = data.customer_email?.toLowerCase() || null;
 
-    // ====== Status: WAITING ======
+    // ====== PENDING ======
     if (status === "waiting") {
       if (email)
         await sendEmail(
@@ -268,7 +269,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("pending");
     }
 
-    // ====== Status: CONFIRMING ======
+    // ====== CONFIRMING ======
     if (status === "confirming") {
       if (email)
         await sendEmail(
@@ -279,7 +280,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("confirming");
     }
 
-    // ====== Status: FAILED ======
+    // ====== FAILED ======
     if (status === "failed") {
       if (email)
         await sendEmail(
@@ -290,7 +291,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("failed");
     }
 
-    // ====== Status: EXPIRED ======
+    // ====== EXPIRED ======
     if (status === "expired") {
       if (email)
         await sendEmail(
@@ -301,7 +302,7 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("expired");
     }
 
-    // ====== Status: FINISHED (SUCCESS) ======
+    // ====== FINISHED (SUCCESS) ======
     if (status === "finished") {
       const amount = safeNum(data.price_amount);
       const currency = data.pay_currency || data.price_currency;
@@ -311,7 +312,7 @@ app.post("/webhook", async (req, res) => {
         data.order_id ||
         `np_${Date.now()}`;
 
-      // Update Firestore
+      // Save payment access
       await db
         .collection("payments")
         .doc(userId)
@@ -331,10 +332,11 @@ app.post("/webhook", async (req, res) => {
           { merge: true }
         );
 
-      // Log transaction
+      // Save transaction record
       await db.collection("transactions").doc(String(txnId)).set(
         {
           userId,
+          referrerId,
           email,
           plan: planSlug,
           amount,
@@ -348,7 +350,28 @@ app.post("/webhook", async (req, res) => {
         { merge: true }
       );
 
-      // Send success email
+      // ===============================
+      // AFFILIATE COMMISSION (20%)
+      // ===============================
+      if (referrerId) {
+        const commission = Number((amount * 0.2).toFixed(2));
+
+        await db.collection("affiliateEarnings").add({
+          userId: referrerId,
+          referredUserId: userId,
+          email,
+          plan: planSlug,
+          amount,
+          commission,
+          commissionStatus: "pending",
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          txnId,
+        });
+
+        console.log(`💰 Commission created: $${commission} for ${referrerId}`);
+      }
+
+      // Success email
       if (email) {
         const successTemplate = EMAIL_TEMPLATES.success(planSlug);
         await sendEmail(email, successTemplate.subject, successTemplate.html);
@@ -361,58 +384,6 @@ app.post("/webhook", async (req, res) => {
   } catch (err) {
     console.error("🔥 Webhook error:", err);
     return res.status(500).send("error");
-  }
-});
-// ========================================================
-// ADMIN BROADCAST (Send email to all subscribers)
-// ========================================================
-app.post("/admin/broadcast", async (req, res) => {
-  try {
-    const { subject, message } = req.body;
-
-    if (!subject || !message) {
-      return res.status(400).json({ error: "Subject & message required" });
-    }
-
-    const snapshot = await db.collection("subscribers").get();
-    if (snapshot.empty) {
-      return res.status(400).json({ error: "No subscribers found" });
-    }
-
-    const emails = snapshot.docs.map((d) => d.data().email);
-
-    const payload = {
-      sender: {
-        name: "SAPP Admin",
-        email: "sapp.academy2025@gmail.com",
-      },
-      to: emails.map((email) => ({ email })),
-      subject,
-      htmlContent: SAPP_TEMPLATE({
-        title: subject,
-        messageHTML: message,
-      }),
-    };
-
-    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-      method: "POST",
-      headers: {
-        "api-key": process.env.BREVO_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const data = await response.json();
-
-    return res.json({
-      success: true,
-      sent_to: emails.length,
-      brevo_response: data,
-    });
-  } catch (err) {
-    console.error("🔥 Broadcast error:", err);
-    return res.status(500).json({ error: "Broadcast failed" });
   }
 });
 
