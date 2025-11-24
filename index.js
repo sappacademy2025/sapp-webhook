@@ -66,65 +66,123 @@ async function sendEmail(to, subject, html) {
 }
 
 // ========================================================
-// AUTO EMAIL TEMPLATES
+// BRAND TEMPLATE WRAPPER
+// ========================================================
+function SAPP_TEMPLATE({ title, messageHTML }) {
+  return `
+  <div style="background:#0d0f12;padding:30px;font-family:Arial,sans-serif;color:white;">
+    <div style="max-width:600px;margin:auto;background:#14171c;padding:40px;border-radius:12px;">
+      
+      <!-- Logo -->
+      <div style="text-align:center;">
+        <img src="https://sapp-webhook-1.onrender.com/logo.png" width="80" style="margin-bottom:15px;">
+      </div>
+
+      <!-- Title -->
+      <h2 style="text-align:center;color:#4ea1ff;">${title}</h2>
+
+      <!-- Message -->
+      <div style="margin-top:20px;line-height:1.8;font-size:15px;">
+        ${messageHTML}
+      </div>
+
+      <!-- CTA Button -->
+      <div style="text-align:center;margin-top:25px;">
+        <a href="https://sapp-academy.web.app"
+          style="background:#007bff;color:white;padding:12px 25px;border-radius:8px;text-decoration:none;font-weight:bold;">
+          Go to Dashboard
+        </a>
+      </div>
+
+      <!-- Footer -->
+      <hr style="margin-top:30px;border-color:#333;">
+      <div style="text-align:center;color:#888;font-size:12px;">
+        SAPP Academy • All Rights Reserved <br>
+        <div style="margin-top:10px;">
+          <a href="https://wa.me/250788000000" style="color:#4ea1ff;text-decoration:none;margin-right:10px;">
+            WhatsApp Support
+          </a>
+          |
+          <a href="https://t.me/sappacademy" style="color:#4ea1ff;text-decoration:none;margin-left:10px;">
+            Telegram
+          </a>
+        </div>
+      </div>
+
+    </div>
+  </div>`;
+}
+// ========================================================
+// AUTO EMAIL TEMPLATES (BRANDED)
 // ========================================================
 const EMAIL_TEMPLATES = {
   welcome: {
     subject: "🎉 Welcome to SAPP Academy!",
-    html: `
-      <h2>🎉 Welcome to SAPP Academy!</h2>
-      <p>Thank you for joining our learning community.</p>
-      <p>You will receive updates on new courses, promotions, and trading insights.</p>
-      <p>Start your journey today!</p>
-    `,
+    html: SAPP_TEMPLATE({
+      title: "Welcome to SAPP Academy!",
+      messageHTML: `
+        <p>Thank you for joining our learning community.</p>
+        <p>You will receive updates on courses, promotions, and trading insights.</p>
+        <p>Start your journey today!</p>
+      `,
+    }),
   },
 
   pending: {
-    subject: "⏳ Payment Pending – Action Required",
-    html: `
-      <h2>⏳ Payment Pending</h2>
-      <p>We received your order and are waiting for your payment.</p>
-      <p>If you already paid, the blockchain is confirming it.</p>
-      <p>We will notify you immediately once it is confirmed.</p>
-    `,
+    subject: "⏳ Payment Pending – Complete Your Payment",
+    html: SAPP_TEMPLATE({
+      title: "Payment Pending",
+      messageHTML: `
+        <p>Your order has been received. We are waiting for your payment.</p>
+        <p>If you already paid, the blockchain is confirming it.</p>
+        <p>You will receive updates automatically.</p>
+      `,
+    }),
   },
 
   confirming: {
     subject: "🔄 Payment Confirming",
-    html: `
-      <h2>🔄 Payment Confirming</h2>
-      <p>Your payment is being confirmed on the blockchain.</p>
-      <p>You will receive another email once your course unlocks.</p>
-    `,
+    html: SAPP_TEMPLATE({
+      title: "Payment Confirming",
+      messageHTML: `
+        <p>Your payment is being confirmed on the blockchain.</p>
+        <p>You will receive another email once your course unlocks.</p>
+      `,
+    }),
   },
-
-  success: (plan) => ({
-    subject: `🎉 Your ${plan} course is now unlocked!`,
-    html: `
-      <h2>🎉 Congratulations!</h2>
-      <p>Your course <b>${plan}</b> has been successfully unlocked.</p>
-      <p>You can now access your dashboard anytime:</p>
-      <a href="https://sapp-academy.web.app">➡ Go to Dashboard</a>
-    `,
-  }),
 
   failed: {
     subject: "❌ Payment Failed",
-    html: `
-      <h2>❌ Payment Failed</h2>
-      <p>Your payment could not be processed.</p>
-      <p>Please try again or contact support.</p>
-    `,
+    html: SAPP_TEMPLATE({
+      title: "Payment Failed",
+      messageHTML: `
+        <p>Your payment could not be processed.</p>
+        <p>Please try again or contact support.</p>
+      `,
+    }),
   },
 
   expired: {
     subject: "⚠️ Payment Expired",
-    html: `
-      <h2>⚠️ Payment Expired</h2>
-      <p>Your payment window has expired.</p>
-      <p>You can try again anytime from your dashboard.</p>
-    `,
+    html: SAPP_TEMPLATE({
+      title: "Payment Expired",
+      messageHTML: `
+        <p>Your payment window expired.</p>
+        <p>You can try again anytime from your dashboard.</p>
+      `,
+    }),
   },
+
+  success: (plan) => ({
+    subject: `🎉 ${plan} Course is Now Unlocked!`,
+    html: SAPP_TEMPLATE({
+      title: `Your ${plan} Course is Unlocked!`,
+      messageHTML: `
+        <p>Congratulations! Your course <b>${plan}</b> is now accessible.</p>
+        <p>Log in anytime and continue learning.</p>
+      `,
+    }),
+  }),
 };
 
 // ========================================================
@@ -167,7 +225,7 @@ app.post("/subscribe", async (req, res) => {
 });
 
 // ========================================================
-// NOWPAYMENTS WEBHOOK
+// NOWPAYMENTS WEBHOOK LOGIC (Statuses + Auto Emails)
 // ========================================================
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
 
@@ -185,9 +243,9 @@ app.post("/webhook", async (req, res) => {
     }
 
     const data = req.body;
+    const status = data.payment_status;
     console.log("💰 Webhook:", data);
 
-    const paymentStatus = data.payment_status;
     const orderParts = (data.order_id || "").split("_");
     if (orderParts.length < 3 || orderParts[0] !== "sapp") {
       return res.status(400).send("Invalid order_id format");
@@ -197,8 +255,8 @@ app.post("/webhook", async (req, res) => {
     const userId = orderParts[2];
     const email = data.customer_email?.toLowerCase() || null;
 
-    // STATUS: PENDING
-    if (paymentStatus === "waiting") {
+    // ====== Status: WAITING ======
+    if (status === "waiting") {
       if (email)
         await sendEmail(
           email,
@@ -208,8 +266,8 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("pending");
     }
 
-    // STATUS: CONFIRMING
-    if (paymentStatus === "confirming") {
+    // ====== Status: CONFIRMING ======
+    if (status === "confirming") {
       if (email)
         await sendEmail(
           email,
@@ -219,8 +277,8 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("confirming");
     }
 
-    // STATUS: FAILED
-    if (paymentStatus === "failed") {
+    // ====== Status: FAILED ======
+    if (status === "failed") {
       if (email)
         await sendEmail(
           email,
@@ -230,8 +288,8 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("failed");
     }
 
-    // STATUS: EXPIRED
-    if (paymentStatus === "expired") {
+    // ====== Status: EXPIRED ======
+    if (status === "expired") {
       if (email)
         await sendEmail(
           email,
@@ -241,8 +299,8 @@ app.post("/webhook", async (req, res) => {
       return res.status(200).send("expired");
     }
 
-    // STATUS: SUCCESS / FINISHED
-    if (paymentStatus === "finished") {
+    // ====== Status: FINISHED (SUCCESS) ======
+    if (status === "finished") {
       const amount = safeNum(data.price_amount);
       const currency = data.pay_currency || data.price_currency;
       const txnId =
@@ -290,8 +348,8 @@ app.post("/webhook", async (req, res) => {
 
       // Send success email
       if (email) {
-        const template = EMAIL_TEMPLATES.success(planSlug);
-        await sendEmail(email, template.subject, template.html);
+        const successTemplate = EMAIL_TEMPLATES.success(planSlug);
+        await sendEmail(email, successTemplate.subject, successTemplate.html);
       }
 
       return res.status(200).send("ok");
@@ -303,9 +361,8 @@ app.post("/webhook", async (req, res) => {
     return res.status(500).send("error");
   }
 });
-
 // ========================================================
-// ADMIN BROADCAST
+// ADMIN BROADCAST (Send email to all subscribers)
 // ========================================================
 app.post("/admin/broadcast", async (req, res) => {
   try {
@@ -323,10 +380,16 @@ app.post("/admin/broadcast", async (req, res) => {
     const emails = snapshot.docs.map((d) => d.data().email);
 
     const payload = {
-      sender: { name: "SAPP Admin", email: "sapp.academy2025@gmail.com" },
+      sender: {
+        name: "SAPP Admin",
+        email: "sapp.academy2025@gmail.com",
+      },
       to: emails.map((email) => ({ email })),
       subject,
-      htmlContent: `<html><body>${message}</body></html>`,
+      htmlContent: SAPP_TEMPLATE({
+        title: subject,
+        messageHTML: message,
+      }),
     };
 
     const response = await fetch("https://api.brevo.com/v3/smtp/email", {
