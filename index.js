@@ -1,7 +1,9 @@
 import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
-import fetch from "node-fetch"; // Required for SMTP API call
+import fetch from "node-fetch"; // For Brevo API
+import dotenv from "dotenv";
+dotenv.config();
 
 const app = express();
 app.use(cors());
@@ -34,7 +36,7 @@ console.log("✅ Firebase connected!");
 const db = admin.firestore();
 
 // ========================================================
-// SEND EMAIL (Brevo SMTP API)
+// SEND A SINGLE EMAIL
 // ========================================================
 app.post("/send-email", async (req, res) => {
   try {
@@ -74,7 +76,58 @@ app.post("/send-email", async (req, res) => {
 });
 
 // ========================================================
-// NOWPAYMENTS WEBHOOK (Upgraded + Auto Email)
+// 📢 BROADCAST EMAIL (ADMIN)
+// ========================================================
+app.post("/admin/broadcast", async (req, res) => {
+  try {
+    const { subject, message } = req.body;
+
+    if (!subject || !message) {
+      return res.status(400).json({ error: "Subject and message required" });
+    }
+
+    const snapshot = await db.collection("subscribers").get();
+    if (snapshot.empty) {
+      return res.status(400).json({ error: "No subscribers found" });
+    }
+
+    const emails = snapshot.docs.map((doc) => doc.data().email);
+
+    const payload = {
+      sender: {
+        name: "SAPP Admin",
+        email: "sapp.academy2025@gmail.com",
+      },
+      to: emails.map((email) => ({ email })),
+      subject,
+      htmlContent: `<html><body>${message}</body></html>`,
+    };
+
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "api-key": process.env.BREVO_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+    console.log("📢 Broadcast result:", data);
+
+    return res.json({
+      success: true,
+      sent_to: emails.length,
+      brevo_response: data,
+    });
+  } catch (error) {
+    console.error("🔥 Broadcast error:", error);
+    return res.status(500).json({ error: "Broadcast failed" });
+  }
+});
+
+// ========================================================
+// NOWPAYMENTS WEBHOOK
 // ========================================================
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
 
@@ -85,7 +138,6 @@ function toNumber(x) {
 
 app.post("/webhook", async (req, res) => {
   try {
-    // Validate signature
     const signature = req.headers["x-nowpayments-sig"];
     if (!signature || signature !== NOWPAYMENTS_SECRET) {
       console.log("❌ Unauthorized webhook request");
@@ -95,12 +147,10 @@ app.post("/webhook", async (req, res) => {
     const data = req.body;
     console.log("💰 Webhook Received:", data);
 
-    // Ignore if not finished
     if (data.payment_status !== "finished") {
       return res.status(200).send("ignored");
     }
 
-    // Parse order_id: sapp_<plan>_<user>
     const orderParts = (data.order_id || "").split("_");
     if (orderParts.length < 3 || orderParts[0] !== "sapp") {
       return res.status(400).send("Invalid order_id");
@@ -116,7 +166,6 @@ app.post("/webhook", async (req, res) => {
     const txnId =
       data.payment_id || data.invoice_id || data.order_id || `np_${Date.now()}`;
 
-    // Save payment status
     await db
       .collection("payments")
       .doc(userId)
@@ -138,7 +187,6 @@ app.post("/webhook", async (req, res) => {
 
     console.log("💾 Payment updated in Firestore");
 
-    // Save transaction
     await db.collection("transactions").doc(String(txnId)).set(
       {
         userId,
@@ -157,7 +205,6 @@ app.post("/webhook", async (req, res) => {
 
     console.log("🧾 Transaction logged");
 
-    // AUTO EMAIL: send unlock email
     if (email) {
       console.log("📨 Sending unlock email to:", email);
 
@@ -208,7 +255,7 @@ app.post("/brevo/webhook", async (req, res) => {
 });
 
 // ========================================================
-// SUBSCRIBE ROUTE
+// SUBSCRIBE API
 // ========================================================
 app.post("/subscribe", async (req, res) => {
   try {
