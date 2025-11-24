@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
-import fetch from "node-fetch"; // Required for SMTP API call
+import fetch from "node-fetch"; // SMTP API calls
 
 const app = express();
 app.use(cors());
@@ -14,7 +14,7 @@ const saRaw =
   process.env.FIREBASE_SERVICE_ACCOUNT || process.env.FIREBASE_CONFIG;
 
 if (!saRaw) {
-  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT environment variable");
+  console.error("❌ Missing FIREBASE_SERVICE_ACCOUNT");
   process.exit(1);
 }
 
@@ -22,7 +22,7 @@ let serviceAccount;
 try {
   serviceAccount = JSON.parse(saRaw);
 } catch (err) {
-  console.error("❌ Invalid JSON in FIREBASE_SERVICE_ACCOUNT:", err);
+  console.error("❌ Invalid FIREBASE_SERVICE_ACCOUNT:", err);
   process.exit(1);
 }
 
@@ -30,20 +30,14 @@ admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-console.log("✅ Firebase connected!");
 const db = admin.firestore();
+console.log("🔥 Firebase connected");
 
 // ========================================================
-// SINGLE EMAIL (used by webhook)
+// EMAIL SENDER FUNCTION (Brevo)
 // ========================================================
-app.post("/send-email", async (req, res) => {
+async function sendEmail(to, subject, html) {
   try {
-    const { to, subject, html } = req.body;
-
-    if (!to || !subject || !html) {
-      return res.status(400).send("Missing email fields");
-    }
-
     const payload = {
       sender: {
         name: "SAPP Academy",
@@ -64,200 +58,77 @@ app.post("/send-email", async (req, res) => {
     });
 
     const data = await response.json();
-    console.log("📧 Brevo Email Sent:", data);
-
-    return res.status(200).json({ ok: true, brevo: data });
-  } catch (error) {
-    console.error("🔥 Email send error:", error);
-    return res.status(500).send("Email error");
+    console.log("📧 Email sent:", data);
+    return data;
+  } catch (err) {
+    console.error("🔥 Email send error:", err);
   }
-});
-
-// ========================================================
-// 📢 ADMIN EMAIL BROADCAST — RAW EMAIL
-// ========================================================
-app.post("/admin/broadcast", async (req, res) => {
-  try {
-    const { subject, message } = req.body;
-
-    if (!subject || !message) {
-      return res.status(400).json({ error: "Subject and message required" });
-    }
-
-    // Get all subscribers
-    const snapshot = await db.collection("subscribers").get();
-
-    if (snapshot.empty) {
-      return res.status(400).json({ error: "No subscribers found" });
-    }
-
-    const emails = snapshot.docs.map((doc) => doc.data().email);
-
-    // Build email payload
-    const payload = {
-      sender: {
-        name: "SAPP Admin",
-        email: "sapp.academy2025@gmail.com",
-      },
-      to: emails.map((email) => ({ email })),
-      subject,
-      htmlContent: `<html><body>${message}</body></html>`,
-    };
-
-    // Send through Brevo
-    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
-      method: "POST",
-      headers: {
-        "api-key": process.env.BREVO_API_KEY,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
-
-    const data = await response.json();
-    console.log("📢 Broadcast result:", data);
-
-    return res.json({
-      success: true,
-      sent_to: emails.length,
-      brevo_response: data,
-    });
-  } catch (error) {
-    console.error("🔥 Broadcast error:", error);
-    return res.status(500).json({ error: "Broadcast failed" });
-  }
-});
-
-// ========================================================
-// NOWPAYMENTS WEBHOOK (Upgraded + Auto Email)
-// ========================================================
-const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
-
-function toNumber(x) {
-  const v = Number(x);
-  return Number.isFinite(v) ? v : null;
 }
 
-app.post("/webhook", async (req, res) => {
-  try {
-    const signature = req.headers["x-nowpayments-sig"];
-    if (!signature || signature !== NOWPAYMENTS_SECRET) {
-      console.log("❌ Unauthorized webhook request");
-      return res.status(401).send("Unauthorized");
-    }
+// ========================================================
+// AUTO EMAIL TEMPLATES
+// ========================================================
+const EMAIL_TEMPLATES = {
+  welcome: {
+    subject: "🎉 Welcome to SAPP Academy!",
+    html: `
+      <h2>🎉 Welcome to SAPP Academy!</h2>
+      <p>Thank you for joining our learning community.</p>
+      <p>You will receive updates on new courses, promotions, and trading insights.</p>
+      <p>Start your journey today!</p>
+    `,
+  },
 
-    const data = req.body;
-    console.log("💰 Webhook Received:", data);
+  pending: {
+    subject: "⏳ Payment Pending – Action Required",
+    html: `
+      <h2>⏳ Payment Pending</h2>
+      <p>We received your order and are waiting for your payment.</p>
+      <p>If you already paid, the blockchain is confirming it.</p>
+      <p>We will notify you immediately once it is confirmed.</p>
+    `,
+  },
 
-    if (data.payment_status !== "finished") {
-      return res.status(200).send("ignored");
-    }
+  confirming: {
+    subject: "🔄 Payment Confirming",
+    html: `
+      <h2>🔄 Payment Confirming</h2>
+      <p>Your payment is being confirmed on the blockchain.</p>
+      <p>You will receive another email once your course unlocks.</p>
+    `,
+  },
 
-    const orderParts = (data.order_id || "").split("_");
-    if (orderParts.length < 3 || orderParts[0] !== "sapp") {
-      return res.status(400).send("Invalid order_id");
-    }
+  success: (plan) => ({
+    subject: `🎉 Your ${plan} course is now unlocked!`,
+    html: `
+      <h2>🎉 Congratulations!</h2>
+      <p>Your course <b>${plan}</b> has been successfully unlocked.</p>
+      <p>You can now access your dashboard anytime:</p>
+      <a href="https://sapp-academy.web.app">➡ Go to Dashboard</a>
+    `,
+  }),
 
-    const planSlug = orderParts[1];
-    const userId = orderParts[2];
-    const email = data.customer_email || null;
+  failed: {
+    subject: "❌ Payment Failed",
+    html: `
+      <h2>❌ Payment Failed</h2>
+      <p>Your payment could not be processed.</p>
+      <p>Please try again or contact support.</p>
+    `,
+  },
 
-    const amount = toNumber(data.price_amount);
-    const currency = data.pay_currency || data.price_currency;
-
-    const txnId =
-      data.payment_id || data.invoice_id || data.order_id || `np_${Date.now()}`;
-
-    await db
-      .collection("payments")
-      .doc(userId)
-      .set(
-        {
-          [planSlug]: {
-            status: "paid",
-            amount,
-            currency,
-            email,
-            gateway: "NOWPayments",
-            orderId: data.order_id,
-            txnId,
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        },
-        { merge: true }
-      );
-
-    console.log("💾 Payment updated in Firestore");
-
-    await db.collection("transactions").doc(String(txnId)).set(
-      {
-        userId,
-        email,
-        plan: planSlug,
-        amount,
-        currency,
-        status: "paid",
-        gateway: "NOWPayments",
-        orderId: data.order_id,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-        raw: data,
-      },
-      { merge: true }
-    );
-
-    console.log("🧾 Transaction logged");
-
-    if (email) {
-      console.log("📨 Sending unlock email to:", email);
-
-      await fetch("https://sapp-webhook-1.onrender.com/send-email", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          to: email,
-          subject: `🎉 Your ${planSlug} course is now unlocked!`,
-          html: `
-            <h2>🎉 Congratulations!</h2>
-            <p>Your course <b>${planSlug}</b> has been successfully unlocked.</p>
-            <p>You can now log in anytime:</p>
-            <a href="https://sapp-academy.web.app">➡ Go to Dashboard</a>
-          `,
-        }),
-      });
-    }
-
-    return res.status(200).send("ok");
-  } catch (err) {
-    console.error("🔥 Webhook error:", err);
-    return res.status(500).send("server error");
-  }
-});
+  expired: {
+    subject: "⚠️ Payment Expired",
+    html: `
+      <h2>⚠️ Payment Expired</h2>
+      <p>Your payment window has expired.</p>
+      <p>You can try again anytime from your dashboard.</p>
+    `,
+  },
+};
 
 // ========================================================
-// BREVO EVENT WEBHOOK
-// ========================================================
-app.post("/brevo/webhook", async (req, res) => {
-  try {
-    const event = req.body;
-
-    if (!event.email) return res.status(200).send("ignored");
-
-    await db.collection("emailEvents").add({
-      email: event.email.toLowerCase(),
-      event: event.event || "unknown",
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      raw: event,
-    });
-
-    return res.status(200).send("stored");
-  } catch (err) {
-    console.error("🔥 Brevo webhook error:", err);
-    return res.status(500).send("error");
-  }
-});
-
-// ========================================================
-// SUBSCRIBE ROUTE
+// SUBSCRIBE (Welcome email)
 // ========================================================
 app.post("/subscribe", async (req, res) => {
   try {
@@ -279,13 +150,13 @@ app.post("/subscribe", async (req, res) => {
         source,
         createdAt: admin.firestore.FieldValue.serverTimestamp(),
       });
-    } else {
-      const id = q.docs[0].id;
-      await db.collection("subscribers").doc(id).update({
-        uid,
-        source,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+
+      // Send welcome email
+      await sendEmail(
+        lower,
+        EMAIL_TEMPLATES.welcome.subject,
+        EMAIL_TEMPLATES.welcome.html
+      );
     }
 
     return res.status(200).send("saved");
@@ -296,7 +167,192 @@ app.post("/subscribe", async (req, res) => {
 });
 
 // ========================================================
-// SERVER START
+// NOWPAYMENTS WEBHOOK
+// ========================================================
+const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
+
+function safeNum(x) {
+  const v = Number(x);
+  return Number.isFinite(v) ? v : null;
+}
+
+app.post("/webhook", async (req, res) => {
+  try {
+    const signature = req.headers["x-nowpayments-sig"];
+    if (!signature || signature !== NOWPAYMENTS_SECRET) {
+      console.log("❌ Unauthorized webhook request");
+      return res.status(401).send("Unauthorized");
+    }
+
+    const data = req.body;
+    console.log("💰 Webhook:", data);
+
+    const paymentStatus = data.payment_status;
+    const orderParts = (data.order_id || "").split("_");
+    if (orderParts.length < 3 || orderParts[0] !== "sapp") {
+      return res.status(400).send("Invalid order_id format");
+    }
+
+    const planSlug = orderParts[1];
+    const userId = orderParts[2];
+    const email = data.customer_email?.toLowerCase() || null;
+
+    // STATUS: PENDING
+    if (paymentStatus === "waiting") {
+      if (email)
+        await sendEmail(
+          email,
+          EMAIL_TEMPLATES.pending.subject,
+          EMAIL_TEMPLATES.pending.html
+        );
+      return res.status(200).send("pending");
+    }
+
+    // STATUS: CONFIRMING
+    if (paymentStatus === "confirming") {
+      if (email)
+        await sendEmail(
+          email,
+          EMAIL_TEMPLATES.confirming.subject,
+          EMAIL_TEMPLATES.confirming.html
+        );
+      return res.status(200).send("confirming");
+    }
+
+    // STATUS: FAILED
+    if (paymentStatus === "failed") {
+      if (email)
+        await sendEmail(
+          email,
+          EMAIL_TEMPLATES.failed.subject,
+          EMAIL_TEMPLATES.failed.html
+        );
+      return res.status(200).send("failed");
+    }
+
+    // STATUS: EXPIRED
+    if (paymentStatus === "expired") {
+      if (email)
+        await sendEmail(
+          email,
+          EMAIL_TEMPLATES.expired.subject,
+          EMAIL_TEMPLATES.expired.html
+        );
+      return res.status(200).send("expired");
+    }
+
+    // STATUS: SUCCESS / FINISHED
+    if (paymentStatus === "finished") {
+      const amount = safeNum(data.price_amount);
+      const currency = data.pay_currency || data.price_currency;
+      const txnId =
+        data.payment_id ||
+        data.invoice_id ||
+        data.order_id ||
+        `np_${Date.now()}`;
+
+      // Update Firestore
+      await db
+        .collection("payments")
+        .doc(userId)
+        .set(
+          {
+            [planSlug]: {
+              status: "paid",
+              amount,
+              currency,
+              email,
+              gateway: "NOWPayments",
+              orderId: data.order_id,
+              txnId,
+              timestamp: admin.firestore.FieldValue.serverTimestamp(),
+            },
+          },
+          { merge: true }
+        );
+
+      // Log transaction
+      await db.collection("transactions").doc(String(txnId)).set(
+        {
+          userId,
+          email,
+          plan: planSlug,
+          amount,
+          currency,
+          status: "paid",
+          gateway: "NOWPayments",
+          orderId: data.order_id,
+          createdAt: admin.firestore.FieldValue.serverTimestamp(),
+          raw: data,
+        },
+        { merge: true }
+      );
+
+      // Send success email
+      if (email) {
+        const template = EMAIL_TEMPLATES.success(planSlug);
+        await sendEmail(email, template.subject, template.html);
+      }
+
+      return res.status(200).send("ok");
+    }
+
+    return res.status(200).send("ignored");
+  } catch (err) {
+    console.error("🔥 Webhook error:", err);
+    return res.status(500).send("error");
+  }
+});
+
+// ========================================================
+// ADMIN BROADCAST
+// ========================================================
+app.post("/admin/broadcast", async (req, res) => {
+  try {
+    const { subject, message } = req.body;
+
+    if (!subject || !message) {
+      return res.status(400).json({ error: "Subject & message required" });
+    }
+
+    const snapshot = await db.collection("subscribers").get();
+    if (snapshot.empty) {
+      return res.status(400).json({ error: "No subscribers found" });
+    }
+
+    const emails = snapshot.docs.map((d) => d.data().email);
+
+    const payload = {
+      sender: { name: "SAPP Admin", email: "sapp.academy2025@gmail.com" },
+      to: emails.map((email) => ({ email })),
+      subject,
+      htmlContent: `<html><body>${message}</body></html>`,
+    };
+
+    const response = await fetch("https://api.brevo.com/v3/smtp/email", {
+      method: "POST",
+      headers: {
+        "api-key": process.env.BREVO_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+
+    return res.json({
+      success: true,
+      sent_to: emails.length,
+      brevo_response: data,
+    });
+  } catch (err) {
+    console.error("🔥 Broadcast error:", err);
+    return res.status(500).json({ error: "Broadcast failed" });
+  }
+});
+
+// ========================================================
+// START SERVER
 // ========================================================
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 SAPP Webhook running on port ${PORT}`));
