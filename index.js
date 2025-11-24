@@ -1,9 +1,7 @@
 import express from "express";
 import cors from "cors";
 import admin from "firebase-admin";
-import fetch from "node-fetch"; // For Brevo API
-import dotenv from "dotenv";
-dotenv.config();
+import fetch from "node-fetch"; // Required for SMTP API call
 
 const app = express();
 app.use(cors());
@@ -36,7 +34,7 @@ console.log("✅ Firebase connected!");
 const db = admin.firestore();
 
 // ========================================================
-// SEND A SINGLE EMAIL
+// SINGLE EMAIL (used by webhook)
 // ========================================================
 app.post("/send-email", async (req, res) => {
   try {
@@ -76,7 +74,7 @@ app.post("/send-email", async (req, res) => {
 });
 
 // ========================================================
-// 📢 BROADCAST EMAIL (ADMIN)
+// 📢 ADMIN EMAIL BROADCAST — RAW EMAIL
 // ========================================================
 app.post("/admin/broadcast", async (req, res) => {
   try {
@@ -86,13 +84,16 @@ app.post("/admin/broadcast", async (req, res) => {
       return res.status(400).json({ error: "Subject and message required" });
     }
 
+    // Get all subscribers
     const snapshot = await db.collection("subscribers").get();
+
     if (snapshot.empty) {
       return res.status(400).json({ error: "No subscribers found" });
     }
 
     const emails = snapshot.docs.map((doc) => doc.data().email);
 
+    // Build email payload
     const payload = {
       sender: {
         name: "SAPP Admin",
@@ -103,6 +104,7 @@ app.post("/admin/broadcast", async (req, res) => {
       htmlContent: `<html><body>${message}</body></html>`,
     };
 
+    // Send through Brevo
     const response = await fetch("https://api.brevo.com/v3/smtp/email", {
       method: "POST",
       headers: {
@@ -127,7 +129,7 @@ app.post("/admin/broadcast", async (req, res) => {
 });
 
 // ========================================================
-// NOWPAYMENTS WEBHOOK
+// NOWPAYMENTS WEBHOOK (Upgraded + Auto Email)
 // ========================================================
 const NOWPAYMENTS_SECRET = process.env.NOWPAYMENTS_SECRET;
 
@@ -255,7 +257,7 @@ app.post("/brevo/webhook", async (req, res) => {
 });
 
 // ========================================================
-// SUBSCRIBE API
+// SUBSCRIBE ROUTE
 // ========================================================
 app.post("/subscribe", async (req, res) => {
   try {
